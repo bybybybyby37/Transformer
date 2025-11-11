@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import tqdm
 
 from models import tokenizer
 
@@ -32,6 +33,7 @@ n_heads = cfg.n_heads
 n_layers = cfg.n_layers
 d_ff = cfg.d_ff
 dropout = cfg.dropout
+warmup = cfg.warmup
 
 grad_clip = cfg.grad_clip
 seed = cfg.seed
@@ -225,7 +227,7 @@ print("TensorBoard logdir:", run_dir)
 os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
 base_opt = torch.optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-9, weight_decay=0.0)
-opt = NoamOpt(d_model, warmup=4000, optimizer=base_opt)
+opt = NoamOpt(d_model, warmup=warmup, optimizer=base_opt)
 
 best_val = float("inf")
 bad_epochs = 0
@@ -246,32 +248,64 @@ for epoch in range(1, max_epochs + 1):
     model.train()
     epoch_start_time = time.time()
 
-    for batch_idx, (xb, yb) in enumerate(train_loader):
+    # Gradient accumulation (set >1 if want to simulate larger batches)
+    accum_steps = 1
+
+    # tqdm progress bar for the current epoch
+    pbar = tqdm(
+        enumerate(train_loader),
+        total=len(train_loader),
+        desc=f"Epoch {epoch}/{max_epochs}",
+        dynamic_ncols=True,
+        leave=False,  # keep only one dynamic line, no screen flooding
+    )
+
+    for batch_idx, (xb, yb) in pbar:
         xb, yb = xb.to(device), yb.to(device)
 
+        # Forward + loss
         _, loss = model(xb, yb)
+        loss = loss / accum_steps
 
+        # Backward + gradient clipping + optimizer step
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        opt.step()
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip))
+        if (batch_idx + 1) % accum_steps == 0:
+            opt.step()
 
-        writer.add_scalar("loss/train_batch", loss.item(), global_step)
+        # Detach scalar values for display/logging
+        loss_item = loss.item() * accum_steps
+        bpc = loss_item / math.log(2)
+        ppl = math.exp(loss_item) if loss_item < 20 else float("inf")
+
+        # Update tqdm line with key metrics
+        pbar.set_postfix({
+            "loss": f"{loss_item:.4f}",
+            "bpc": f"{bpc:.3f}",
+            "ppl": f"{ppl:.1f}" if ppl != float("inf") else "inf",
+            "lr": f"{opt.lr:.6f}",
+            "gnorm": f"{grad_norm:.2f}",
+        })
+
+        # TensorBoard logging
+        writer.add_scalar("loss/train_batch", loss_item, global_step)
         writer.add_scalar("lr", opt.lr, global_step)
+        writer.add_scalar("grad_norm", grad_norm, global_step)
         global_step += 1
 
-        if batch_idx % 100 == 0:
-            print(f"Epoch {epoch} | Batch {batch_idx}/{len(train_loader)} | Loss {loss.item():.4f} | lr {opt.lr:.6f}")
+    # End of epoch summary
+    tqdm.write(f"[Epoch {epoch}] time={time.time() - epoch_start_time:.1f}s")
 
-    print(f"Epoch {epoch} finished in {time.time() - epoch_start_time:.2f}s. Running validation.")
+    # ---- Validation phase ----
     val_loss = evaluate(val_loader)
-    bpc = val_loss / math.log(2)  # bits-per-char for char LM
-    print(f"Epoch {epoch:4d} | Val Loss {val_loss:.4f} | Val BPC {bpc:.4f}")
+    bpc = val_loss / math.log(2)
+    tqdm.write(f"[Epoch {epoch}] Val Loss {val_loss:.4f} | Val BPC {bpc:.4f}")
 
     writer.add_scalar("loss/val", val_loss, epoch)
     writer.add_scalar("metrics/val_bpc", bpc, epoch)
 
-    # early stopping on val loss
+    # ---- Early stopping and checkpointing ----
     if val_loss < best_val:
         best_val = val_loss
         bad_epochs = 0
@@ -284,13 +318,14 @@ for epoch in range(1, max_epochs + 1):
             "config": dict(d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
                            dropout=dropout, block_size=block_size, vocab_size=vocab_size)
         }, save_path)
-        print(f"Improved! Best val_loss={best_val:.4f} (saved to {save_path})")
+        tqdm.write(f"Improved! Best val_loss={best_val:.4f} (saved to {save_path})")
     else:
         bad_epochs += 1
-        print(f"No improvement ({bad_epochs}/{patience})")
+        tqdm.write(f"No improvement ({bad_epochs}/{patience})")
         if bad_epochs >= patience:
-            print("Early stopping triggered.")
+            tqdm.write("Early stopping triggered.")
             break
+
 
 # -----------------------------
 # Test best checkpoint + a sample generation
