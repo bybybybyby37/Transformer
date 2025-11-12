@@ -230,15 +230,14 @@ def main():
     print("TensorBoard logdir:", run_dir)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    base_opt = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9, weight_decay=0.0)
-    # opt = NoamOpt(d_model, warmup=warmup, optimizer=base_opt)
-
     def noam_lr_lambda(step: int):
-        step = max(1, step)
+        if step <= 0:
+            return 0.0
         return (d_model ** -0.5) * min(step ** -0.5, step * (warmup ** -1.5))
 
+    base_opt = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
     scheduler = torch.optim.lr_scheduler.LambdaLR(base_opt, lr_lambda=noam_lr_lambda)
-
+    scheduler.step()
 
     best_val = float("inf")
     bad_epochs = 0
@@ -283,6 +282,9 @@ def main():
                 _, loss = model(xb, yb)
                 loss = loss / accum_steps
 
+            current_lr = base_opt.param_groups[0]['lr']
+            writer.add_scalar("lr", current_lr, global_step)
+            
             # Backward + gradient clipping + optimizer step
             base_opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -298,7 +300,6 @@ def main():
             bpc = loss_item / math.log(2)
             ppl = math.exp(loss_item) if loss_item < 20 else float("inf")
 
-            current_lr = base_opt.param_groups[0]['lr']
             # Update tqdm line with key metrics
             pbar.set_postfix({
                 "loss": f"{loss_item:.4f}",
@@ -310,7 +311,6 @@ def main():
 
             # TensorBoard logging
             writer.add_scalar("loss/train_batch", loss_item, global_step)
-            writer.add_scalar("lr", current_lr, global_step)
             writer.add_scalar("grad_norm", grad_norm, global_step)
             global_step += 1
 
