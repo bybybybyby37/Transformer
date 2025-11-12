@@ -4,8 +4,8 @@
     "split_ratio": [0.8, 0.1, 0.1],
     "block_size": 256,
     "batch_size": 32,
-    "patience": 5,
-    "max_epochs": 200,
+    "patience": 8,
+    "max_epochs": 500,
     "stride_overlap_ratio": 0.5,
 
     "d_model": 256,
@@ -13,6 +13,7 @@
     "n_layers": 6,
     "d_ff": 1024,
     "dropout": 0.2,
+    "warmup": 10,
 
     "learning_rate": 0.002,
     "weight_decay": 0.01,
