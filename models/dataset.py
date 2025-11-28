@@ -1,0 +1,60 @@
+# models/dataset.py
+import torch
+import csv
+from torch.utils.data import Dataset
+
+class TranslationDataset(Dataset):
+    def __init__(self, csv_path, tokenizer, max_len=128):
+        """
+        Args:
+            csv_path: 指向 train.csv, validation.csv 或 test.csv
+            tokenizer: BPETokenizer 实例
+        """
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.src_lines = []
+        self.tgt_lines = []
+        
+        print(f"Loading data from {csv_path}...")
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None) # 跳过表头 en,zh
+            
+            for row in reader:
+                if len(row) >= 2:
+                    self.src_lines.append(row[0]) # 英文
+                    self.tgt_lines.append(row[1]) # 中文
+
+        print(f"Loaded {len(self.src_lines)} pairs from {csv_path}.")
+
+    def __len__(self):
+        return len(self.src_lines)
+
+    def __getitem__(self, idx):
+        src_text = self.src_lines[idx]
+        tgt_text = self.tgt_lines[idx]
+        
+        # 编码 (自动加 <sos>, <eos> 由我们在 dataset 中控制更安全，或者 tokenizer 已加)
+        # 假设 tokenizer.encode(add_special_tokens=True) 已经加上了 sos/eos
+        src_ids = self.tokenizer.encode(src_text, add_special_tokens=True)
+        tgt_ids = self.tokenizer.encode(tgt_text, add_special_tokens=True)
+        
+        # 截断
+        if len(src_ids) > self.max_len:
+            src_ids = src_ids[:self.max_len]
+            src_ids[-1] = self.tokenizer.eos_token_id # 确保以 eos 结尾
+            
+        if len(tgt_ids) > self.max_len:
+            tgt_ids = tgt_ids[:self.max_len]
+            tgt_ids[-1] = self.tokenizer.eos_token_id
+
+        return torch.tensor(src_ids), torch.tensor(tgt_ids)
+
+def collate_fn(batch, pad_idx):
+    """
+    动态 Padding，这一点不用变，非常适合你的显卡
+    """
+    src_batch, tgt_batch = zip(*batch)
+    src_padded = torch.nn.utils.rnn.pad_sequence(src_batch, batch_first=True, padding_value=pad_idx)
+    tgt_padded = torch.nn.utils.rnn.pad_sequence(tgt_batch, batch_first=True, padding_value=pad_idx)
+    return src_padded, tgt_padded
