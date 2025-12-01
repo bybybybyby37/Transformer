@@ -3,7 +3,7 @@
 
     "data_path_train": "data/train.csv",
     "data_path_valid": "data/validation.csv",
-    "tokenizer_path": "config/tokenizer_en_zh.json",
+    "tokenizer_path": "config/tokenizer_small_en_zh.json",
     "save_path": "checkpoints/transformer_en_zh.pt",
     
     "split_ratio": [0.9, 0.1],

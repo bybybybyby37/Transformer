@@ -5,7 +5,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
 
 # 修改路径为你实际下载的 csv 文件路径
 TRAIN_CSV_FILE = "data/train.csv" 
-VOCAB_SIZE = 30000
+VOCAB_SIZE = 16000
 
 def build_tokenizer():
     print(f"Building Tokenizer from CSV file: {TRAIN_CSV_FILE}")
@@ -40,7 +40,7 @@ def build_tokenizer():
     tokenizer.train_from_iterator(csv_iterator(), trainer=trainer)
     
     os.makedirs("config", exist_ok=True)
-    save_path = "config/tokenizer_en_zh.json"
+    save_path = "config/tokenizer_small_en_zh.json"
     tokenizer.save(save_path)
     print(f"Success! Tokenizer saved to {save_path}")
 
