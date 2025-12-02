@@ -24,7 +24,8 @@ class TranslationDataset(Dataset):
                 if len(row) >= 2:
                     self.src_lines.append(row[0]) # 英文
                     self.tgt_lines.append(row[1]) # 中文
-
+                    
+        self.lengths = [min(len(self.tokenizer.encode(s, add_special_tokens=False)) + 2, max_len) for s in self.src_lines]
         print(f"Loaded {len(self.src_lines)} pairs from {csv_path}.")
 
     def __len__(self):
@@ -38,6 +39,9 @@ class TranslationDataset(Dataset):
         # 假设 tokenizer.encode(add_special_tokens=True) 已经加上了 sos/eos
         src_ids = self.tokenizer.encode(src_text, add_special_tokens=True)
         tgt_ids = self.tokenizer.encode(tgt_text, add_special_tokens=True)
+
+        if len(src_ids) == 0: src_ids = [self.tokenizer.unk_token_id] # 防止空输入
+        if len(tgt_ids) == 0: tgt_ids = [self.tokenizer.unk_token_id]
         
         # 截断
         if len(src_ids) > self.max_len:

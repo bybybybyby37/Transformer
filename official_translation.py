@@ -12,8 +12,9 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
+from models.sampler import TokenBucketSampler
 
-# 屏蔽烦人的警告
+# ignore console warnings
 warnings.filterwarnings("ignore")
 
 from models import tokenizer as my_tokenizer
@@ -21,11 +22,11 @@ from models import dataset as my_dataset
 from models import model as my_model
 
 # -----------------------------
-# 辅助函数
+# Auxiliary functions
 # -----------------------------
 def evaluate(model, loader, criterion, vocab_size, device):
     """
-    计算验证集/测试集的 Loss 和 PPL
+    Calculate the Loss and PPL of the validation/test set
     """
     model.eval()
     total_loss = 0
@@ -37,7 +38,7 @@ def evaluate(model, loader, criterion, vocab_size, device):
             tgt_input = tgt[:, :-1]
             tgt_out = tgt[:, 1:]
             
-            # 混合精度推理
+            # enable amp
             with torch.amp.autocast('cuda', enabled=(device.type=='cuda')):
                 logits = model(src, tgt_input)
                 loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
@@ -55,7 +56,7 @@ def evaluate(model, loader, criterion, vocab_size, device):
 
 def translate(model, src_sentence, tokenizer, device, max_len):
     """
-    推理函数：输入英文，输出中文
+    Inference function: Input English, output Chinese
     """
     model.eval()
     src_ids = tokenizer.encode(src_sentence, add_special_tokens=True)
@@ -75,10 +76,10 @@ def translate(model, src_sentence, tokenizer, device, max_len):
     return tokenizer.decode(tgt_tokens, skip_special_tokens=True)
 
 # -----------------------------
-# 主程序
+# Main Functions
 # -----------------------------
 def main():
-    # 1. Config 加载
+    # Load Config
     CONFIG_PATH = os.path.join("config", "hyperparameters.json")
     with open(CONFIG_PATH, "r") as f:
         cfg = json.load(f, object_hook=lambda d: SimpleNamespace(**d))
@@ -86,16 +87,15 @@ def main():
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {DEVICE} | Batch: {cfg.batch_size} | D_Model: {cfg.d_model}")
     
-    # [修改点 3] TensorBoard 保存到 Google Drive
-    # 假设 cfg.save_path 已经在 Drive 里了，我们把 log 也放进去
-    drive_root = os.path.dirname(cfg.save_path) # e.g. /content/drive/MyDrive/Transformer_Checkpoints
+    # ensure the save path for model-Checkpoint
+    drive_root = os.path.dirname(cfg.save_path) 
     log_dir = os.path.join(drive_root, "runs", f"exp_{time.strftime('%Y%m%d-%H%M')}")
     os.makedirs(log_dir, exist_ok=True)
     
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging to Drive: {log_dir}")
 
-    # 2. Tokenizer & Data
+    # Tokenizer & Data
     print(f"Loading Tokenizer...")
     tok = my_tokenizer.BPETokenizer(cfg.tokenizer_path)
     VOCAB_SIZE = tok.vocab_size
@@ -104,33 +104,43 @@ def main():
     print("Loading Datasets...")
     train_ds = my_dataset.TranslationDataset(cfg.data_path_train, tok, max_len=cfg.max_len)
     
-    # Validation Set
+    # Validation Setrain_dst
     if os.path.exists(cfg.data_path_valid):
         valid_ds = my_dataset.TranslationDataset(cfg.data_path_valid, tok, max_len=cfg.max_len)
     else:
         valid_ds = train_ds
 
-    # [修改点 1] Test Set 加载 (用于最终测试)
+    # load test data for final test
     test_ds = None
-    TEST_CSV = "data/test.csv" # 假设你的 test.csv 在这里
+    TEST_CSV = "data/test.csv"  
     if os.path.exists(TEST_CSV):
         print(f"Loading Test Set from {TEST_CSV}...")
         test_ds = my_dataset.TranslationDataset(TEST_CSV, tok, max_len=cfg.max_len)
     
+    MAX_TOKENS = cfg.max_tokens
+
+    # init Sampler
+    train_sampler = TokenBucketSampler(train_ds, max_tokens=MAX_TOKENS, shuffle=True)
+    valid_sampler = TokenBucketSampler(valid_ds, max_tokens=MAX_TOKENS, shuffle=False)
+
     WORKERS = 0 
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True, 
+        train_ds, 
+        batch_sampler=train_sampler, 
         collate_fn=partial(my_dataset.collate_fn, pad_idx=PAD_IDX),
-        num_workers=WORKERS, pin_memory=True
+        num_workers=WORKERS, 
+        pin_memory=True
     )
+    
     valid_loader = DataLoader(
-        valid_ds, batch_size=cfg.batch_size, shuffle=False, 
+        valid_ds, 
+        batch_sampler=valid_sampler, 
         collate_fn=partial(my_dataset.collate_fn, pad_idx=PAD_IDX),
         num_workers=WORKERS
     )
     
-    # 3. Model
+    # Model
     print("Initializing Transformer...")
     transformer = my_model.TransformerSeq2Seq(
         src_vocab_size=VOCAB_SIZE, tgt_vocab_size=VOCAB_SIZE,
@@ -143,8 +153,8 @@ def main():
     for p in transformer.parameters():
         if p.dim() > 1: nn.init.xavier_uniform_(p)
 
-    # 4. Optimizer & Scheduler
-    # 注意：这里 lr 设为 1.0 交给 Noam Scheduler
+    # Optimizer & Scheduler
+    # set lr to 1.0 so that Noam Scheduler will ACTUALLY handle it
     optimizer = torch.optim.Adam(
         transformer.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9, weight_decay=cfg.weight_decay
     )
@@ -154,14 +164,14 @@ def main():
         return factor * (model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5)))
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: rate(step, cfg.d_model, factor=1.0, warmup=cfg.warmup)
+        optimizer, lr_lambda=lambda step: rate(step, cfg.d_model, factor=cfg.scheduler_factor, warmup=cfg.warmup)
     )
     
     criterion = nn.CrossEntropyLoss(
-        ignore_index=PAD_IDX, label_smoothing=getattr(cfg, 'label_smoothing', 0.0)
+        ignore_index=PAD_IDX, label_smoothing=getattr(cfg, 'label_smoothing', 0.1)
     )
 
-    # 5. 断点续训与状态恢复
+    # load Checkpoint and Resuming training
     best_val_loss = float('inf')
     global_step = 0
     total_start = time.time()
@@ -171,7 +181,7 @@ def main():
         print(f"Found checkpoint at {cfg.save_path}, resuming training...")
         checkpoint = torch.load(cfg.save_path, map_location=DEVICE)
         
-        # 兼容性检查
+        # Compatibility check
         if 'model_state_dict' in checkpoint:
             transformer.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -185,7 +195,7 @@ def main():
     else:
         print("No checkpoint found, starting from scratch.")
 
-    # 6. Training Loop
+    # Training Loop
     for epoch in range(start_epoch, cfg.max_epochs + 1):
         transformer.train()
         epoch_loss = 0
@@ -222,7 +232,7 @@ def main():
         writer.add_scalar("val/loss", val_loss, epoch)
         writer.add_scalar("val/ppl", val_ppl, epoch)
         
-        # [修改点 2] 打印 Validation PPL
+        # print Validation PPL
         print(f"\nEpoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | Val PPL: {val_ppl:.2f}")
 
         if val_loss < best_val_loss:
@@ -238,11 +248,11 @@ def main():
             torch.save(checkpoint, cfg.save_path)
             print(f"  [Saved] Best Val Loss to Drive")
 
-        # 简单采样 (Hello world)
+        # try translate "Hello world"
         print("  Sample:", translate(transformer, "Hello world.", tok, DEVICE, cfg.max_len))
         print("-" * 50)
     
-    # 7. 最终测试阶段 (Training 完成后)
+    # final Test after all epoch
     # ----------------------------------------------------
     if test_ds is not None:
         print("\n" + "="*20 + " FINAL TEST REPORT " + "="*20)
@@ -252,13 +262,13 @@ def main():
             num_workers=WORKERS
         )
         
-        # A. 定量评估 (Loss & PPL)
+        # A. Evaluate (Loss & PPL)
         test_loss, test_ppl = evaluate(transformer, test_loader, criterion, VOCAB_SIZE, DEVICE)
         print(f"Test Set Results: Loss = {test_loss:.4f} | PPL = {test_ppl:.2f}")
         
-        # B. 定性评估 (随机抽取样本对比)
+        # B. Evaluate (Randomly selected samples)
         print("\nRandom Test Samples:")
-        indices = random.sample(range(len(test_ds)), k=min(5, len(test_ds))) # 随机抽5个
+        indices = random.sample(range(len(test_ds)), k=min(5, len(test_ds))) # pick random 5
         for idx in indices:
             src_raw = test_ds.src_lines[idx]
             tgt_raw = test_ds.tgt_lines[idx]
