@@ -10,7 +10,6 @@
     "block_size": 256,
     "max_len": 128,
     "batch_size": 32,
-    "max_tokens": 4096,
     "patience": 5,
     "max_epochs": 100,
 

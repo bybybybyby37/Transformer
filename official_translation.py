@@ -9,38 +9,55 @@ import random
 import warnings
 from types import SimpleNamespace
 from tqdm import tqdm
-from torch.utils.data import DataLoader
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
-from models.sampler import TokenBucketSampler
 
 # ignore console warnings
 warnings.filterwarnings("ignore")
 
-from models import tokenizer as my_tokenizer
-from models import dataset as my_dataset
 from models import model as my_model
+from models.data_interface import create_iwslt17_dataloaders
 
 # -----------------------------
 # Auxiliary functions
 # -----------------------------
+def translate(model, src_sentence, sp_processor, device, max_len):
+    model.eval()
+    
+    ids = sp_processor.EncodeAsIds(src_sentence)
+
+    src_ids = [sp_processor.bos_id()] + ids + [sp_processor.eos_id()]
+    
+    src = torch.tensor(src_ids).unsqueeze(0).to(device)
+    
+    # Decoder input
+    tgt_tokens = [sp_processor.bos_id()]
+    
+    for i in range(max_len):
+        tgt_tensor = torch.tensor(tgt_tokens).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = model(src, tgt_tensor)
+        next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
+        
+        if next_token == sp_processor.eos_id():
+            break
+        tgt_tokens.append(next_token)
+        
+    # SentencePiece decode
+    return sp_processor.DecodeIds(tgt_tokens[1:]) 
+
+
 def evaluate(model, loader, criterion, vocab_size, device):
-    """
-    Calculate the Loss and PPL of the validation/test set
-    """
     model.eval()
     total_loss = 0
     total_count = 0
     
     with torch.no_grad():
-        for src, tgt in loader:
-            src, tgt = src.to(device), tgt.to(device)
-            tgt_input = tgt[:, :-1]
-            tgt_out = tgt[:, 1:]
+        for src, tgt_in, tgt_out in loader:
+            src, tgt_in, tgt_out = src.to(device), tgt_in.to(device), tgt_out.to(device)
             
-            # enable amp
             with torch.amp.autocast('cuda', enabled=(device.type=='cuda')):
-                logits = model(src, tgt_input)
+                logits = model(src, tgt_in)
                 loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
             
             total_loss += loss.item()
@@ -51,29 +68,7 @@ def evaluate(model, loader, criterion, vocab_size, device):
         ppl = math.exp(avg_loss)
     except OverflowError:
         ppl = float('inf')
-        
     return avg_loss, ppl
-
-def translate(model, src_sentence, tokenizer, device, max_len):
-    """
-    Inference function: Input English, output Chinese
-    """
-    model.eval()
-    src_ids = tokenizer.encode(src_sentence, add_special_tokens=True)
-    src = torch.tensor(src_ids).unsqueeze(0).to(device)
-    tgt_tokens = [tokenizer.sos_token_id]
-    
-    for i in range(max_len):
-        tgt_tensor = torch.tensor(tgt_tokens).unsqueeze(0).to(device)
-        with torch.no_grad():
-            logits = model(src, tgt_tensor)
-        next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
-        
-        if next_token == tokenizer.eos_token_id:
-            break
-        tgt_tokens.append(next_token)
-        
-    return tokenizer.decode(tgt_tokens, skip_special_tokens=True)
 
 # -----------------------------
 # Main Functions
@@ -85,7 +80,21 @@ def main():
         cfg = json.load(f, object_hook=lambda d: SimpleNamespace(**d))
 
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("Initializing Data Pipeline (SentencePiece)...")
     print(f"Device: {DEVICE} | Batch: {cfg.batch_size} | D_Model: {cfg.d_model}")
+
+    sp, train_loader, val_loader, test_loader = create_iwslt17_dataloaders(
+        vocab_size=8000,   
+        max_src_len=cfg.max_len,
+        max_tgt_len=cfg.max_len,
+        batch_size=cfg.batch_size,
+        num_workers=2
+    )
+    
+    PAD_IDX = sp.pad_id()
+    VOCAB_SIZE = sp.GetPieceSize()
+    
+    print(f"Vocab Size: {VOCAB_SIZE}, Pad Id: {PAD_IDX}")
     
     # ensure the save path for model-Checkpoint
     drive_root = os.path.dirname(cfg.save_path) 
@@ -94,51 +103,6 @@ def main():
     
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging to Drive: {log_dir}")
-
-    # Tokenizer & Data
-    print(f"Loading Tokenizer...")
-    tok = my_tokenizer.BPETokenizer(cfg.tokenizer_path)
-    VOCAB_SIZE = tok.vocab_size
-    PAD_IDX = tok.pad_token_id
-    
-    print("Loading Datasets...")
-    train_ds = my_dataset.TranslationDataset(cfg.data_path_train, tok, max_len=cfg.max_len)
-    
-    # Validation Setrain_dst
-    if os.path.exists(cfg.data_path_valid):
-        valid_ds = my_dataset.TranslationDataset(cfg.data_path_valid, tok, max_len=cfg.max_len)
-    else:
-        valid_ds = train_ds
-
-    # load test data for final test
-    test_ds = None
-    TEST_CSV = "data/test.csv"  
-    if os.path.exists(TEST_CSV):
-        print(f"Loading Test Set from {TEST_CSV}...")
-        test_ds = my_dataset.TranslationDataset(TEST_CSV, tok, max_len=cfg.max_len)
-    
-    MAX_TOKENS = cfg.max_tokens
-
-    # init Sampler
-    train_sampler = TokenBucketSampler(train_ds, max_tokens=MAX_TOKENS, shuffle=True)
-    valid_sampler = TokenBucketSampler(valid_ds, max_tokens=MAX_TOKENS, shuffle=False)
-
-    WORKERS = 0 
-
-    train_loader = DataLoader(
-        train_ds, 
-        batch_sampler=train_sampler, 
-        collate_fn=partial(my_dataset.collate_fn, pad_idx=PAD_IDX),
-        num_workers=WORKERS, 
-        pin_memory=True
-    )
-    
-    valid_loader = DataLoader(
-        valid_ds, 
-        batch_sampler=valid_sampler, 
-        collate_fn=partial(my_dataset.collate_fn, pad_idx=PAD_IDX),
-        num_workers=WORKERS
-    )
     
     # Model
     print("Initializing Transformer...")
@@ -163,8 +127,9 @@ def main():
         if step == 0: step = 1
         return factor * (model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5)))
 
+    scheduler_factor = getattr(cfg, 'scheduler_factor', 0.5)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: rate(step, cfg.d_model, factor=cfg.scheduler_factor, warmup=cfg.warmup)
+        optimizer, lr_lambda=lambda step: rate(step, cfg.d_model, factor=scheduler_factor, warmup=cfg.warmup)
     )
     
     criterion = nn.CrossEntropyLoss(
@@ -201,16 +166,14 @@ def main():
         epoch_loss = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.max_epochs}", dynamic_ncols=True)
 
-        for src, tgt in pbar:
-            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
-            tgt_input = tgt[:, :-1]
-            tgt_out = tgt[:, 1:]
+        for src, tgt_in, tgt_out in pbar:
+            src, tgt_in, tgt_out = src.to(DEVICE), tgt_in.to(DEVICE), tgt_out.to(DEVICE)
 
             optimizer.zero_grad()
             with torch.amp.autocast('cuda', enabled=(DEVICE.type=='cuda')):
-                logits = transformer(src, tgt_input)
-                loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt_out.reshape(-1))
-            
+                logits = transformer(src, tgt_in)
+                loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt_out.reshape(-1))    
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(transformer.parameters(), cfg.grad_clip)
             optimizer.step()
@@ -228,7 +191,7 @@ def main():
         avg_train_loss = epoch_loss / len(train_loader)
         
         # Validation
-        val_loss, val_ppl = evaluate(transformer, valid_loader, criterion, VOCAB_SIZE, DEVICE)
+        val_loss, val_ppl = evaluate(transformer, val_loader, criterion, VOCAB_SIZE, DEVICE)
         writer.add_scalar("val/loss", val_loss, epoch)
         writer.add_scalar("val/ppl", val_ppl, epoch)
         
@@ -249,36 +212,38 @@ def main():
             print(f"  [Saved] Best Val Loss to Drive")
 
         # try translate "Hello world"
-        print("  Sample:", translate(transformer, "Hello world.", tok, DEVICE, cfg.max_len))
+        print("  Sample:", translate(transformer, "Hello world.", sp, DEVICE, cfg.max_len))
         print("-" * 50)
     
-    # final Test after all epoch
     # ----------------------------------------------------
-    if test_ds is not None:
-        print("\n" + "="*20 + " FINAL TEST REPORT " + "="*20)
-        test_loader = DataLoader(
-            test_ds, batch_size=cfg.batch_size, shuffle=False, 
-            collate_fn=partial(my_dataset.collate_fn, pad_idx=PAD_IDX),
-            num_workers=WORKERS
-        )
+    # FINAL TEST REPORT
+    # ----------------------------------------------------
+    print("\n" + "="*20 + " FINAL TEST REPORT " + "="*20)
+    
+    # A. Quantitative Evaluate
+    test_loss, test_ppl = evaluate(transformer, test_loader, criterion, VOCAB_SIZE, DEVICE)
+    print(f"Test Set Results: Loss = {test_loss:.4f} | PPL = {test_ppl:.2f}")
+    
+    # B. Qualitative Evaluate (Random Samples)
+    print("\nRandom Test Samples:")
+    
+    dataset_handle = test_loader.dataset 
+    total_samples = len(dataset_handle)
+    
+    indices = random.sample(range(total_samples), k=min(5, total_samples))
+    
+    for idx in indices:
+        raw_item = dataset_handle.data[idx]['translation']
+        src_raw = raw_item['en']
+        tgt_raw = raw_item['zh']
         
-        # A. Evaluate (Loss & PPL)
-        test_loss, test_ppl = evaluate(transformer, test_loader, criterion, VOCAB_SIZE, DEVICE)
-        print(f"Test Set Results: Loss = {test_loss:.4f} | PPL = {test_ppl:.2f}")
+        pred = translate(transformer, src_raw, sp, DEVICE, cfg.max_len)
         
-        # B. Evaluate (Randomly selected samples)
-        print("\nRandom Test Samples:")
-        indices = random.sample(range(len(test_ds)), k=min(5, len(test_ds))) # pick random 5
-        for idx in indices:
-            src_raw = test_ds.src_lines[idx]
-            tgt_raw = test_ds.tgt_lines[idx]
-            pred = translate(transformer, src_raw, tok, DEVICE, cfg.max_len)
-            
-            print(f"\n[Case {idx}]")
-            print(f"  Src : {src_raw}")
-            print(f"  Ref : {tgt_raw}")
-            print(f"  Pred: {pred}")
-        print("="*60)
+        print(f"\n[Case {idx}]")
+        print(f"  Src : {src_raw}")
+        print(f"  Ref : {tgt_raw}")
+        print(f"  Pred: {pred}")
+    print("="*60)
     
     writer.close()
 
