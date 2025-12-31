@@ -7,6 +7,8 @@ import os
 import json
 import random
 import warnings
+import heapq
+import sacrebleu
 from types import SimpleNamespace
 from tqdm import tqdm
 from functools import partial
@@ -49,8 +51,12 @@ def translate(model, src_sentence, sp_processor, device, max_len):
 
 def evaluate(model, loader, criterion, vocab_size, device):
     model.eval()
-    total_loss = 0
+    total_loss = 0      # record Loss (Val Loss) with smoothing
+    total_ppl_loss = 0  # record Loss (for PPL calculation) without smoothing
     total_count = 0
+
+    # Criterion to calculate PPL (without Label Smoothing)
+    ppl_criterion = nn.CrossEntropyLoss(ignore_index=criterion.ignore_index, label_smoothing=0.0)
     
     with torch.no_grad():
         for src, tgt_in, tgt_out in loader:
@@ -58,17 +64,100 @@ def evaluate(model, loader, criterion, vocab_size, device):
             
             with torch.amp.autocast('cuda', enabled=(device.type=='cuda')):
                 logits = model(src, tgt_in)
+                
+                # calculate regular loss (with label smoothing, used for reporting validation loss)
                 loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
+                
+                # calculate loss for PPL (without label smoothing)
+                loss_clean = ppl_criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
             
             total_loss += loss.item()
+            total_ppl_loss += loss_clean.item() # accumulate clean loss (no smoothing) for perplexity
             total_count += 1
             
     avg_loss = total_loss / max(total_count, 1)
+    
+    # NOTE: use clean loss (without smoothing) to compute perplexity
+    avg_ppl_loss = total_ppl_loss / max(total_count, 1)
+    
     try:
-        ppl = math.exp(avg_loss)
+        ppl = math.exp(avg_ppl_loss)
     except OverflowError:
         ppl = float('inf')
+        
     return avg_loss, ppl
+
+
+def beam_search_translate(model, src_sentence, sp_processor, device, max_len=128, beam_width=5, alpha=0.6):
+    model.eval()
+    
+    # Encode
+    ids = sp_processor.EncodeAsIds(src_sentence)
+    src_ids = [sp_processor.bos_id()] + ids + [sp_processor.eos_id()]
+    src = torch.tensor(src_ids).unsqueeze(0).to(device)
+    
+    # Start symbol
+    # (score, tokens)
+    # score: accumulated log probability (larger is better)
+    start_token = sp_processor.bos_id()
+    
+    # candidate list: [(log_prob, [tokens])]
+    candidates = [(0.0, [start_token])]
+    
+    # completed sequences
+    completed_sequences = []
+    
+    for _ in range(max_len):
+        next_candidates = []
+        
+        for score, current_seq in candidates:
+            # if this partial sequence has already ended, don't expand it further
+            if current_seq[-1] == sp_processor.eos_id():
+                completed_sequences.append((score, current_seq))
+                continue
+                
+            # prepare decoder input
+            tgt_tensor = torch.tensor(current_seq).unsqueeze(0).to(device)
+            
+            with torch.no_grad():
+                # Transformer forward
+                logits = model(src, tgt_tensor)
+                
+            # get distribution for the last token
+            last_token_logits = logits[0, -1, :]
+            # convert to log_softmax
+            log_probs = torch.log_softmax(last_token_logits, dim=0)
+            
+            # select top K tokens
+            topk_log_probs, topk_ids = torch.topk(log_probs, beam_width)
+            
+            for k in range(beam_width):
+                prob = topk_log_probs[k].item()
+                token_id = topk_ids[k].item()
+                
+                # apply repetition penalty (e.g., n-gram blocking or repetition penalty can be added here)
+                # not adding it for now; observe basic beam search behavior first
+                
+                new_score = score + prob
+                new_seq = current_seq + [token_id]
+                next_candidates.append((new_score, new_seq))
+        
+        # sort and keep top beam_width candidates (sorted by score descending)
+        candidates = sorted(next_candidates, key=lambda x: x[0], reverse=True)[:beam_width]
+        
+        # break if there are no candidates to expand
+        if len(candidates) == 0:
+            break
+            
+    # if no completed sequences, fall back to current candidates
+    if len(completed_sequences) == 0:
+        completed_sequences = candidates
+        
+    # length penalty: avoid bias against longer sequences
+    # Score = LogProb / (Length ^ alpha)
+    best_seq = max(completed_sequences, key=lambda x: x[0] / (len(x[1])**alpha))
+    
+    return sp_processor.DecodeIds(best_seq[1][1:]) # remove bos
 
 # -----------------------------
 # Main Functions
@@ -220,11 +309,41 @@ def main():
     # ----------------------------------------------------
     print("\n" + "="*20 + " FINAL TEST REPORT " + "="*20)
     
-    # A. Quantitative Evaluate
+    # Quantitative Evaluate
     test_loss, test_ppl = evaluate(transformer, test_loader, criterion, VOCAB_SIZE, DEVICE)
     print(f"Test Set Results: Loss = {test_loss:.4f} | PPL = {test_ppl:.2f}")
     
-    # B. Qualitative Evaluate (Random Samples)
+    # Collect all predictions and reference translations
+    all_preds = []
+    all_refs = []
+
+    print("Calculating BLEU score...")
+    num_samples = 1000 
+    subset_indices = range(min(num_samples, len(test_loader.dataset)))
+
+    # iterate over the test set for inference
+    for i in tqdm(subset_indices, desc="Translating", unit="sent"):
+        # get raw text (bypass tensors)
+        raw_item = test_loader.dataset.data[i]['translation']
+        src_text = raw_item['en']
+        tgt_text = raw_item['zh'] # reference translation
+        
+        # generate predictions using beam search
+        with torch.no_grad():
+             pred_text = beam_search_translate(transformer, src_text, sp, DEVICE, cfg.max_len)
+        
+        all_preds.append(pred_text)
+        all_refs.append(tgt_text)
+
+    # Compute BLEU
+    bleu = sacrebleu.corpus_bleu(all_preds, [all_refs], tokenize='zh')
+
+    print(f"\n=========================================")
+    print(f"TEST BLEU: {bleu.score:.2f}")
+    print(f"Signature: {bleu}")
+    print(f"=========================================")
+
+    # Qualitative Evaluate (Random Samples)
     print("\nRandom Test Samples:")
     
     dataset_handle = test_loader.dataset 
@@ -237,7 +356,7 @@ def main():
         src_raw = raw_item['en']
         tgt_raw = raw_item['zh']
         
-        pred = translate(transformer, src_raw, sp, DEVICE, cfg.max_len)
+        pred = beam_search_translate(transformer, src_raw, sp, DEVICE, cfg.max_len, beam_width=5)
         
         print(f"\n[Case {idx}]")
         print(f"  Src : {src_raw}")

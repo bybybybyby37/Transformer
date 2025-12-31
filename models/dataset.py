@@ -7,8 +7,8 @@ class TranslationDataset(Dataset):
     def __init__(self, csv_path, tokenizer, max_len=128):
         """
         Args:
-            csv_path: 指向 train.csv, validation.csv 或 test.csv
-            tokenizer: BPETokenizer 实例
+            csv_path: path to train.csv, validation.csv, or test.csv
+            tokenizer: instance of BPETokenizer
         """
         self.tokenizer = tokenizer
         self.max_len = max_len
@@ -18,12 +18,12 @@ class TranslationDataset(Dataset):
         print(f"Loading data from {csv_path}...")
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.reader(f)
-            header = next(reader, None) # 跳过表头 en,zh
+            header = next(reader, None) # skip header (en, zh)
             
             for row in reader:
                 if len(row) >= 2:
-                    self.src_lines.append(row[0]) # 英文
-                    self.tgt_lines.append(row[1]) # 中文
+                    self.src_lines.append(row[0]) # English
+                    self.tgt_lines.append(row[1]) # Chinese
                     
         self.lengths = [min(len(self.tokenizer.encode(s, add_special_tokens=False)) + 2, max_len) for s in self.src_lines]
         print(f"Loaded {len(self.src_lines)} pairs from {csv_path}.")
@@ -35,18 +35,18 @@ class TranslationDataset(Dataset):
         src_text = self.src_lines[idx]
         tgt_text = self.tgt_lines[idx]
         
-        # 编码 (自动加 <sos>, <eos> 由我们在 dataset 中控制更安全，或者 tokenizer 已加)
-        # 假设 tokenizer.encode(add_special_tokens=True) 已经加上了 sos/eos
+        # Encoding (we control adding <sos>/<eos> in the dataset for safety; tokenizer may already add them)
+        # assume tokenizer.encode(add_special_tokens=True) adds <sos>/<eos>
         src_ids = self.tokenizer.encode(src_text, add_special_tokens=True)
         tgt_ids = self.tokenizer.encode(tgt_text, add_special_tokens=True)
 
-        if len(src_ids) == 0: src_ids = [self.tokenizer.unk_token_id] # 防止空输入
+        if len(src_ids) == 0: src_ids = [self.tokenizer.unk_token_id] # prevent empty input
         if len(tgt_ids) == 0: tgt_ids = [self.tokenizer.unk_token_id]
         
-        # 截断
+        # truncation
         if len(src_ids) > self.max_len:
             src_ids = src_ids[:self.max_len]
-            src_ids[-1] = self.tokenizer.eos_token_id # 确保以 eos 结尾
+            src_ids[-1] = self.tokenizer.eos_token_id # ensure ends with eos
             
         if len(tgt_ids) > self.max_len:
             tgt_ids = tgt_ids[:self.max_len]
@@ -56,7 +56,7 @@ class TranslationDataset(Dataset):
 
 def collate_fn(batch, pad_idx):
     """
-    动态 Padding，这一点不用变，非常适合你的显卡
+    Dynamic padding — keep as is; it's efficient for GPUs
     """
     src_batch, tgt_batch = zip(*batch)
     src_padded = torch.nn.utils.rnn.pad_sequence(src_batch, batch_first=True, padding_value=pad_idx)

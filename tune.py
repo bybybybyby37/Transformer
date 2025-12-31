@@ -30,22 +30,44 @@ def evaluate_loss(model, loader, criterion, vocab_size, device):
     return total_loss / max(total_count, 1)
 
 def objective(trial):
-    # 1. 定义超参数搜索空间
-    cfg_overrides = {
-        # 学习率搜索范围
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1.0, log=True),
-        "dropout": trial.suggest_float("dropout", 0.1, 0.4),
-        "warmup": trial.suggest_int("warmup", 2000, 8000),
-        
-        # Scheduler Factor
-        "scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 1.0),
-        
-        # [变化] 因为队友代码不支持 Token Batching，我们回归搜索 Batch Size
-        # T4 显存大，可以尝试大一点的 Batch
-        "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128]) 
-    }
+    # ================= 1. 定义智能搜索空间 =================
     
-    # 2. 加载并更新配置
+    # A. 决定模型的基础宽度 (256 vs 512)
+    d_model = 256
+    n_heads = 4              # 64 dim per head (Standard)
+    num_encoder_layers = 6   # 回归 6 层
+    num_decoder_layers = 6   # 回归 6 层
+    dim_feedforward = 1024   # 4倍 d_model
+    
+    # 【正则化】：这是 Tune 的重点
+    # 之前 0.12 左右表现不错，我们在附近细搜
+    dropout = trial.suggest_float("dropout", 0.1, 0.3)
+    
+    # 【优化器】：寻找最佳收敛速度
+    # 之前 Factor 1.08 有点激进，改为 0.05 - 0.5
+    scheduler_factor = trial.suggest_float("scheduler_factor", 0.05, 0.5)
+
+    warmup = trial.suggest_int("warmup", 2000, 5000)
+    
+    # Transformer 喜欢大 Batch，搜一下最佳平衡点
+    batch_size = trial.suggest_categorical("batch_size", [32, 64])
+        
+    # C. 其他超参数
+    cfg_overrides = {
+        "d_model": d_model,
+        "n_heads": n_heads,
+        "num_encoder_layers": num_encoder_layers,
+        "num_decoder_layers": num_decoder_layers,
+        "dim_feedforward": dim_feedforward,
+        "dropout": dropout,
+        "scheduler_factor": scheduler_factor,
+        "warmup": warmup,
+        "batch_size": batch_size,
+        "learning_rate": 1.0 
+    }
+    # =======================================================
+    
+    # 2. 加载基础配置
     with open("config/hyperparameters.json", "r") as f:
         base_cfg = json.load(f)
     base_cfg.update(cfg_overrides)
@@ -53,14 +75,17 @@ def objective(trial):
     
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 3. 使用队友接口加载数据
-    # 注意：这里 num_workers=0 是为了 Windows 兼容，上云记得改成 2
+    # 初始化 GradScaler (这是修复 NaN 的关键)
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+
+    # 3. 数据加载 (切记：确保 create_iwslt17_dataloaders 里的 vocab_size 改回了 8000)
+    # 建议直接在 tune.py 里写死 8000，防止 json 没改对
     sp, train_loader, val_loader, _ = create_iwslt17_dataloaders(
-        vocab_size=8000,
+        vocab_size=8000,  # <--- 强制回退到 8000
         max_src_len=cfg.max_len,
         max_tgt_len=cfg.max_len,
         batch_size=cfg.batch_size,
-        num_workers=2  # 如果在本地测试报错，请改为 0
+        num_workers=2
     )
     
     VOCAB_SIZE = sp.GetPieceSize()
@@ -104,11 +129,28 @@ def objective(trial):
                 logits = model(src, tgt_in)
                 loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt_out.reshape(-1))
             
-            loss.backward()
+            # 使用 Scaler 进行反向传播和步进
+            # 1. Scale Loss
+            scaler.scale(loss).backward()
+            
+            # 2. Unscale Gradients (为了进行梯度裁剪，必须先 Unscale)
+            scaler.unscale_(optimizer)
+            
+            # 3. 梯度裁剪 (现在是安全的，因为已经 Unscale 了)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            
+            # 4. Step Optimizer
+            scaler.step(optimizer)
+            
+            # 5. Update Scaler
+            scaler.update()
+            
+            # Scheduler 正常步进
             scheduler.step()
-            total_loss += loss.item()
+            
+            # 检查是否有 NaN (如果有，scaler.step 会跳过，loss 可能是 nan)
+            if not torch.isnan(loss):
+                total_loss += loss.item()
 
         # 验证
         val_loss = evaluate_loss(model, val_loader, criterion, VOCAB_SIZE, DEVICE)
@@ -125,7 +167,7 @@ if __name__ == "__main__":
     
     # 1. 运行搜索
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=20) # 在云端可以设大一点，比如 50
+    study.optimize(objective, n_trials=30) # 在云端可以设大一点，比如 50
     
     print("\n" + "="*20 + " TUNING FINISHED " + "="*20)
     print("Best params found:", study.best_params)

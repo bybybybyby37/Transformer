@@ -1,31 +1,29 @@
 {
     "comment": "Translation Task Configuration",
-
     "data_path_train": "data/train.csv",
     "data_path_valid": "data/validation.csv",
     "tokenizer_path": "config/tokenizer_small_en_zh.json",
     "save_path": "checkpoints/transformer_en_zh.pt",
-    
-    "split_ratio": [0.9, 0.1],
+    "split_ratio": [
+        0.9,
+        0.1
+    ],
     "block_size": 256,
     "max_len": 128,
     "batch_size": 32,
     "patience": 5,
-    "max_epochs": 100,
-
+    "max_epochs": 40,
     "d_model": 256,
     "n_heads": 4,
-    "num_encoder_layers": 6,
-    "num_decoder_layers": 6,
+    "num_encoder_layers": 4,
+    "num_decoder_layers": 4,
     "dim_feedforward": 1024,
-    "dropout": 0.1,
-    
-    "weight_decay": 1e-4,
-    "warmup": 4000,
-    "learning_rate": 0.0001,
-    "scheduler_factor": 1.0,
+    "dropout": 0.16616675761574684,
+    "weight_decay": 0.0001,
+    "warmup": 2031,
+    "learning_rate": 0.010531601614892111,
+    "scheduler_factor": 0.49549104783396075,
     "label_smoothing": 0.1,
     "grad_clip": 1.0,
-
     "seed": 1337
 }

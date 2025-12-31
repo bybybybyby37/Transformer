@@ -22,7 +22,7 @@ def set_seed(seed: int = 1337):
 def _train_sentencepiece_model(
     texts: List[str],
     model_prefix: str,
-    vocab_size: int = 8000,
+    vocab_size: int = 16000,
 ):
     os.makedirs(os.path.dirname(model_prefix), exist_ok=True)
     input_txt = model_prefix + ".txt"
@@ -46,7 +46,7 @@ def _train_sentencepiece_model(
 
 def load_or_train_spm_for_iwslt17(
     spm_dir: str = "spm",
-    vocab_size: int = 8000,
+    vocab_size: int = 16000,
 ) -> spm.SentencePieceProcessor:
     """
     read or train IWSLT17 En-Zh 's shared sentencepiece model.

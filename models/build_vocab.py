@@ -1,9 +1,9 @@
 # models/build_vocab.py
 import os
-import csv  # 新增：引入 csv 模块
+import csv
 from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
 
-# 修改路径为你实际下载的 csv 文件路径
+# change TRAIN_CSV_FILE to the path of your downloaded CSV file
 TRAIN_CSV_FILE = "data/train.csv" 
 VOCAB_SIZE = 16000
 
@@ -25,11 +25,10 @@ def build_tokenizer():
         show_progress=True
     )
 
-    # 修改：适配 CSV 的迭代器
     def csv_iterator():
         with open(TRAIN_CSV_FILE, "r", encoding="utf-8") as f:
             reader = csv.reader(f)
-            header = next(reader, None) # 跳过第一行标题 (en, zh)
+            header = next(reader, None) # skip the first line header (en, zh)
             
             for row in reader:
                 if len(row) >= 2:

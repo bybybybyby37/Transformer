@@ -8,7 +8,7 @@ class PositionalEncoding(nn.Module):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         
-        # 预计算位置编码
+        # precompute positional encodings
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
@@ -27,12 +27,12 @@ class TransformerSeq2Seq(nn.Module):
         self, 
         src_vocab_size, 
         tgt_vocab_size, 
-        d_model,              # 来自 json
-        n_heads,              # 来自 json
-        num_encoder_layers,   # 来自 json
-        num_decoder_layers,   # 来自 json
-        dim_feedforward,      # 来自 json
-        dropout,              # 来自 json
+        d_model,              # from config
+        n_heads,              # from config
+        num_encoder_layers,   # from config
+        num_decoder_layers,   # from config
+        dim_feedforward,      # from config
+        dropout,              # from config
         pad_idx=0
     ):
         super().__init__()
@@ -55,6 +55,7 @@ class TransformerSeq2Seq(nn.Module):
         )
 
         self.generator = nn.Linear(d_model, tgt_vocab_size)
+        self.generator.weight = self.tgt_tok_emb.weight
 
     def generate_square_subsequent_mask(self, sz, device):
         mask = (torch.triu(torch.ones((sz, sz), device=device)) == 1).transpose(0, 1)
