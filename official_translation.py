@@ -173,17 +173,22 @@ def main():
     print(f"Device: {DEVICE} | Batch: {cfg.batch_size} | D_Model: {cfg.d_model}")
 
     sp, train_loader, val_loader, test_loader = create_iwslt17_dataloaders(
-        vocab_size=8000,   
+        vocab_size=getattr(cfg, 'vocab_size', 8000),
         max_src_len=cfg.max_len,
         max_tgt_len=cfg.max_len,
         batch_size=cfg.batch_size,
-        num_workers=2
+        num_workers=2,
+        seed=getattr(cfg, 'seed', 1337)
     )
     
     PAD_IDX = sp.pad_id()
     VOCAB_SIZE = sp.GetPieceSize()
     
-    print(f"Vocab Size: {VOCAB_SIZE}, Pad Id: {PAD_IDX}")
+    # beam search parameters
+    BEAM_WIDTH = getattr(cfg, 'beam_width', 5)
+    BEAM_ALPHA = getattr(cfg, 'beam_alpha', 0.6)
+    
+    print(f"Vocab Size: {VOCAB_SIZE}, Pad Id: {PAD_IDX} | Beam: {BEAM_WIDTH}, Alpha: {BEAM_ALPHA}")
     
     # ensure the save path for model-Checkpoint
     drive_root = os.path.dirname(cfg.save_path) 
@@ -330,7 +335,7 @@ def main():
         
         # generate predictions using beam search
         with torch.no_grad():
-             pred_text = beam_search_translate(transformer, src_text, sp, DEVICE, cfg.max_len)
+             pred_text = beam_search_translate(transformer, src_text, sp, DEVICE, cfg.max_len, beam_width=BEAM_WIDTH, alpha=BEAM_ALPHA)
         
         all_preds.append(pred_text)
         all_refs.append(tgt_text)
@@ -356,7 +361,7 @@ def main():
         src_raw = raw_item['en']
         tgt_raw = raw_item['zh']
         
-        pred = beam_search_translate(transformer, src_raw, sp, DEVICE, cfg.max_len, beam_width=5)
+        pred = beam_search_translate(transformer, src_raw, sp, DEVICE, cfg.max_len, beam_width=BEAM_WIDTH, alpha=BEAM_ALPHA)
         
         print(f"\n[Case {idx}]")
         print(f"  Src : {src_raw}")
