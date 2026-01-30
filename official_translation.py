@@ -88,76 +88,102 @@ def evaluate(model, loader, criterion, vocab_size, device):
     return avg_loss, ppl
 
 
+@torch.no_grad()
 def beam_search_translate(model, src_sentence, sp_processor, device, max_len=128, beam_width=5, alpha=0.6):
+    """
+    Performs Beam Search translation.
+    Optimized with vectorization and encoder memory reuse.
+    """
     model.eval()
     
-    # Encode
-    ids = sp_processor.EncodeAsIds(src_sentence)
-    src_ids = [sp_processor.bos_id()] + ids + [sp_processor.eos_id()]
-    src = torch.tensor(src_ids).unsqueeze(0).to(device)
+    # 1. Preprocessing: Encode source sentence
+    tokens = sp_processor.EncodeAsIds(src_sentence)
+    src_ids = [sp_processor.bos_id()] + tokens + [sp_processor.eos_id()]
     
-    # Start symbol
-    # (score, tokens)
-    # score: accumulated log probability (larger is better)
-    start_token = sp_processor.bos_id()
+    # Create tensor: [1, src_len]
+    src_tensor = torch.tensor([src_ids], device=device) 
     
-    # candidate list: [(log_prob, [tokens])]
-    candidates = [(0.0, [start_token])]
+    # Generate source padding mask
+    src_mask = model.make_src_mask(src_tensor) 
     
-    # completed sequences
-    completed_sequences = []
+    # 2. Run Encoder (Only Once)
+    # Get the encoder memory: [1, src_len, d_model]
+    memory = model.encode(src_tensor, src_mask) 
     
-    for _ in range(max_len):
-        next_candidates = []
+    # 3. Prepare Beam Search (Vectorized)
+    # Expand memory to match beam width: [beam_width, src_len, d_model]
+    memory = memory.expand(beam_width, -1, -1)
+    # Correct for nn.Transformer API
+    src_mask = src_mask.expand(beam_width, -1)
+    
+    # Initialize sequences with BOS token: [beam_width, 1]
+    cur_sequences = torch.full((beam_width, 1), sp_processor.bos_id(), device=device)
+    
+    # Initialize scores
+    # The first beam has score 0, others -inf to force starting from the first beam
+    beam_scores = torch.zeros(beam_width, device=device)
+    beam_scores[1:] = -1e9 
+    
+    final_results = []
+    
+    # 4. Step-by-step Generation
+    for step in range(max_len):
+        # Create causal mask for the decoder
+        tgt_mask = model.make_tgt_mask(cur_sequences)
         
-        for score, current_seq in candidates:
-            # if this partial sequence has already ended, don't expand it further
-            if current_seq[-1] == sp_processor.eos_id():
-                completed_sequences.append((score, current_seq))
-                continue
-                
-            # prepare decoder input
-            tgt_tensor = torch.tensor(current_seq).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                # Transformer forward
-                logits = model(src, tgt_tensor)
-                
-            # get distribution for the last token
-            last_token_logits = logits[0, -1, :]
-            # convert to log_softmax
-            log_probs = torch.log_softmax(last_token_logits, dim=0)
-            
-            # select top K tokens
-            topk_log_probs, topk_ids = torch.topk(log_probs, beam_width)
-            
-            for k in range(beam_width):
-                prob = topk_log_probs[k].item()
-                token_id = topk_ids[k].item()
-                
-                # apply repetition penalty (e.g., n-gram blocking or repetition penalty can be added here)
-                # not adding it for now; observe basic beam search behavior first
-                
-                new_score = score + prob
-                new_seq = current_seq + [token_id]
-                next_candidates.append((new_score, new_seq))
+        # Run Decoder (single pass for all beams)
+        outputs = model.decode(cur_sequences, memory, src_mask, tgt_mask)
         
-        # sort and keep top beam_width candidates (sorted by score descending)
-        candidates = sorted(next_candidates, key=lambda x: x[0], reverse=True)[:beam_width]
+        # Get logits for the last token: [beam_width, vocab_size]
+        logits = outputs[:, -1, :] 
+        log_probs = torch.log_softmax(logits, dim=-1)
         
-        # break if there are no candidates to expand
-        if len(candidates) == 0:
+        # Calculate total scores: [beam_width, vocab_size]
+        # Broadcasting: (beam_width, 1) + (beam_width, vocab_size)
+        total_scores = beam_scores.unsqueeze(1) + log_probs
+        
+        # Select top-k candidates across all beams
+        # Flatten view to find global top-k
+        top_scores, top_indices = torch.topk(total_scores.view(-1), beam_width)
+        
+        # Decouple indices to find origin beam and new token
+        prev_beam_indices = top_indices // model.tgt_vocab_size
+        next_token_ids = top_indices % model.tgt_vocab_size
+        
+        # Update sequences: Append new tokens to selected beams
+        cur_sequences = torch.cat([cur_sequences[prev_beam_indices], next_token_ids.unsqueeze(1)], dim=1)
+        
+        # Update scores
+        beam_scores = top_scores
+        
+        # 5. Check for EOS (End of Sentence)
+        is_eos = (next_token_ids == sp_processor.eos_id())
+        if is_eos.any():
+            for i in range(beam_width):
+                if is_eos[i]:
+                    # Apply length penalty: score / (length ^ alpha)
+                    s = beam_scores[i] / (cur_sequences[i].size(0) ** alpha)
+                    final_results.append((s, cur_sequences[i].tolist()))
+                    
+                    # Mark this beam as finished by setting score to -inf
+                    beam_scores[i] = -1e9 
+                    
+        # If all beams are finished, break early
+        if (beam_scores < -1e8).all(): 
             break
+
+    # 6. Finalize Results
+    # If no sequence ended with EOS (reached max_len), take current candidates
+    if not final_results:
+        for i in range(beam_width):
+            score = beam_scores[i] / (cur_sequences[i].size(0) ** alpha)
+            final_results.append((score, cur_sequences[i].tolist()))
             
-    # if no completed sequences, fall back to current candidates
-    if len(completed_sequences) == 0:
-        completed_sequences = candidates
-        
-    # length penalty: avoid bias against longer sequences
-    # Score = LogProb / (Length ^ alpha)
-    best_seq = max(completed_sequences, key=lambda x: x[0] / (len(x[1])**alpha))
+    # Select the sequence with the highest score
+    best_seq = max(final_results, key=lambda x: x[0])[1]
     
-    return sp_processor.DecodeIds(best_seq[1][1:]) # remove bos
+    # Decode IDs to string (removing BOS token at index 0)
+    return sp_processor.DecodeIds(best_seq[1:])
 
 # -----------------------------
 # Main Functions

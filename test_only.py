@@ -19,10 +19,10 @@ def main():
     CONFIG_PATH = os.path.join("config", "hyperparameters.json")
     
     # choose model here
-    MODEL_PATH = "checkpoints/transformer_en_zh.pt"
+    MODEL_PATH = "checkpoints/best_model_synth.pt"
     
     # sample setting here, "None" if choose the full test set
-    TEST_SAMPLES = 1000 
+    TEST_SAMPLES = None
     
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -80,6 +80,9 @@ def main():
     BEAM_WIDTH = getattr(cfg, 'beam_width', 10)
     BEAM_ALPHA = getattr(cfg, 'beam_alpha', 1.2) 
     
+    BEAM_WIDTH = 10
+    BEAM_ALPHA = 1.1
+
     # auto decide test sample length
     if TEST_SAMPLES:
         indices = range(min(TEST_SAMPLES, len(test_loader.dataset)))
@@ -101,9 +104,17 @@ def main():
 
     bleu = sacrebleu.corpus_bleu(all_preds, [all_refs], tokenize='zh')
 
+
     print(f"\n=========================================")
     print(f"TEST BLEU: {bleu.score:.2f}")
     print(f"Signature: {bleu}")
+    print(f"=========================================")
+
+    chrf = sacrebleu.corpus_chrf(all_preds, [all_refs], remove_whitespace=True)
+    
+    print("=========================================")
+    print(f"TEST chrF: {chrf.score:.2f}")
+    print(f"Signature (chrF): {chrf}")
     print(f"=========================================")
 
 if __name__ == "__main__":
