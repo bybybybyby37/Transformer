@@ -8,3 +8,4 @@ config/hyperparameters.json.bak
 checkpoints/
 temp.py
 __pycache__
+final_predictions_synth.txt

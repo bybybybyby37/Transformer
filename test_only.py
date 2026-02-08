@@ -9,7 +9,6 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 
-# 复用你现有的模块
 from models import model as my_model
 from models.data_interface import IWSLT17EnZhDataset, load_or_train_spm_for_iwslt17, collate_translation_batch
 from official_translation import evaluate, beam_search_translate
@@ -23,6 +22,8 @@ def main():
     
     # sample setting here, "None" if choose the full test set
     TEST_SAMPLES = None
+
+    OUTPUT_FILE = "final_predictions_synth.txt"
     
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -31,6 +32,7 @@ def main():
 
     print(f"Testing Model: {MODEL_PATH}")
     print(f"Device: {DEVICE}")
+    print(f"Results will be saved to: {OUTPUT_FILE}")
 
     # preparing test dataset
     sp = load_or_train_spm_for_iwslt17(vocab_size=getattr(cfg, 'vocab_size', 8000))
@@ -91,16 +93,25 @@ def main():
         indices = range(len(test_loader.dataset))
         print("Full Mode: Testing all samples.")
 
-    for i in tqdm(indices, desc="Translating", unit="sent"):
-        raw_item = test_loader.dataset.data[i]['translation']
-        src_text = raw_item['en']
-        tgt_text = raw_item['zh']
-        
-        with torch.no_grad():
-             pred_text = beam_search_translate(transformer, src_text, sp, DEVICE, cfg.max_len, beam_width=BEAM_WIDTH, alpha=BEAM_ALPHA)
-        
-        all_preds.append(pred_text)
-        all_refs.append(tgt_text)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f_out:
+            
+            for i in tqdm(indices, desc="Translating", unit="sent"):
+                raw_item = test_loader.dataset.data[i]['translation']
+                src_text = raw_item['en']
+                tgt_text = raw_item['zh']
+                
+                with torch.no_grad():
+                    pred_text = beam_search_translate(transformer, src_text, sp, DEVICE, cfg.max_len, beam_width=BEAM_WIDTH, alpha=BEAM_ALPHA)
+                
+                all_preds.append(pred_text)
+                all_refs.append(tgt_text)
+
+                # output will be write here
+                f_out.write(f"Sample {i}:\n")
+                f_out.write(f"Source: {src_text}\n")
+                f_out.write(f"Ref:    {tgt_text}\n")
+                f_out.write(f"Pred:   {pred_text}\n")
+                f_out.write("-" * 50 + "\n") # 分隔符
 
     bleu = sacrebleu.corpus_bleu(all_preds, [all_refs], tokenize='zh')
 
